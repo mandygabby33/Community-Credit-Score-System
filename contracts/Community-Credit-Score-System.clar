@@ -8,6 +8,12 @@
 (define-constant ERR_SELF_ENDORSEMENT (err u106))
 (define-constant ERR_ALREADY_ENDORSED (err u107))
 
+(define-constant ERR_GUARANTEE_NOT_FOUND (err u108))
+(define-constant ERR_GUARANTEE_ALREADY_EXISTS (err u109))
+(define-constant ERR_INSUFFICIENT_GUARANTEE_SCORE (err u110))
+(define-constant ERR_GUARANTEE_LIMIT_EXCEEDED (err u111))
+
+
 (define-map user-profiles principal {
     total-borrowed: uint,
     total-repaid: uint,
@@ -243,5 +249,96 @@
     (match (get-loan loan-id)
         loan (is-eq (get borrower loan) tx-sender)
         false
+    )
+)
+
+(define-map loan-guarantees uint {
+    guarantor: principal,
+    guaranteed-amount: uint,
+    guarantee-fee: uint,
+    active: bool,
+    created-at: uint
+})
+
+(define-map user-guarantee-stats principal {
+    total-guaranteed: uint,
+    active-guarantees: uint,
+    successful-guarantees: uint,
+    defaulted-guarantees: uint,
+    guarantee-earnings: uint
+})
+
+(define-read-only (get-guarantee (loan-id uint))
+    (map-get? loan-guarantees loan-id)
+)
+
+(define-read-only (get-guarantee-stats (user principal))
+    (default-to 
+        {
+            total-guaranteed: u0,
+            active-guarantees: u0,
+            successful-guarantees: u0,
+            defaulted-guarantees: u0,
+            guarantee-earnings: u0
+        }
+        (map-get? user-guarantee-stats user)
+    )
+)
+
+(define-public (offer-guarantee (loan-id uint) (guarantee-fee uint))
+    (let (
+        (loan (unwrap! (get-loan loan-id) ERR_LOAN_NOT_FOUND))
+        (guarantor-score (calculate-credit-score tx-sender))
+        (stats (get-guarantee-stats tx-sender))
+    )
+    (asserts! (>= guarantor-score u700) ERR_INSUFFICIENT_GUARANTEE_SCORE)
+    (asserts! (not (is-eq tx-sender (get borrower loan))) ERR_UNAUTHORIZED)
+    (asserts! (is-none (get-guarantee loan-id)) ERR_GUARANTEE_ALREADY_EXISTS)
+    (asserts! (< (get active-guarantees stats) u5) ERR_GUARANTEE_LIMIT_EXCEEDED)
+    (map-set loan-guarantees loan-id {
+        guarantor: tx-sender,
+        guaranteed-amount: (get amount loan),
+        guarantee-fee: guarantee-fee,
+        active: true,
+        created-at: stacks-block-height
+    })
+    (map-set user-guarantee-stats tx-sender (merge stats {
+        total-guaranteed: (+ (get total-guaranteed stats) (get amount loan)),
+        active-guarantees: (+ (get active-guarantees stats) u1)
+    }))
+    (ok true)
+    )
+)
+
+(define-public (resolve-guarantee (loan-id uint))
+    (let (
+        (loan (unwrap! (get-loan loan-id) ERR_LOAN_NOT_FOUND))
+        (guarantee (unwrap! (get-guarantee loan-id) ERR_GUARANTEE_NOT_FOUND))
+        (guarantor (get guarantor guarantee))
+        (stats (get-guarantee-stats guarantor))
+    )
+    (asserts! (get active guarantee) ERR_UNAUTHORIZED)
+    (if (get repaid loan)
+        (begin
+            (map-set user-guarantee-stats guarantor (merge stats {
+                successful-guarantees: (+ (get successful-guarantees stats) u1),
+                active-guarantees: (- (get active-guarantees stats) u1),
+                guarantee-earnings: (+ (get guarantee-earnings stats) (get guarantee-fee guarantee))
+            }))
+            (map-set loan-guarantees loan-id (merge guarantee {active: false}))
+            (ok true)
+        )
+        (if (> stacks-block-height (get due-block loan))
+            (begin
+                (map-set user-guarantee-stats guarantor (merge stats {
+                    defaulted-guarantees: (+ (get defaulted-guarantees stats) u1),
+                    active-guarantees: (- (get active-guarantees stats) u1)
+                }))
+                (map-set loan-guarantees loan-id (merge guarantee {active: false}))
+                (ok true)
+            )
+            ERR_UNAUTHORIZED
+        )
+    )
     )
 )
