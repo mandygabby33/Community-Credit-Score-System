@@ -8,6 +8,12 @@
 (define-constant ERR_SELF_ENDORSEMENT (err u106))
 (define-constant ERR_ALREADY_ENDORSED (err u107))
 
+(define-constant ERR_INSURANCE_NOT_FOUND (err u112))
+(define-constant ERR_INSURANCE_EXPIRED (err u113))
+(define-constant ERR_INSUFFICIENT_PREMIUM (err u114))
+(define-constant ERR_CLAIM_NOT_ELIGIBLE (err u115))
+(define-constant ERR_POLICY_ACTIVE (err u116))
+
 (define-constant ERR_GUARANTEE_NOT_FOUND (err u108))
 (define-constant ERR_GUARANTEE_ALREADY_EXISTS (err u109))
 (define-constant ERR_INSUFFICIENT_GUARANTEE_SCORE (err u110))
@@ -340,5 +346,107 @@
             ERR_UNAUTHORIZED
         )
     )
+    )
+)
+
+(define-map insurance-policies principal {
+    coverage-amount: uint,
+    premium-paid: uint,
+    protected-score: uint,
+    expiry-block: uint,
+    active: bool,
+    claims-used: uint,
+    max-claims: uint,
+    purchased-at: uint
+})
+
+(define-map insurance-claims principal {
+    last-claim-block: uint,
+    total-claims: uint,
+    total-payout: uint
+})
+
+(define-data-var insurance-pool uint u0)
+(define-data-var total-premiums uint u0)
+
+(define-read-only (get-insurance-policy (user principal))
+    (map-get? insurance-policies user)
+)
+
+(define-read-only (get-claim-history (user principal))
+    (default-to 
+        {
+            last-claim-block: u0,
+            total-claims: u0,
+            total-payout: u0
+        }
+        (map-get? insurance-claims user)
+    )
+)
+
+(define-read-only (calculate-premium (coverage-amount uint) (duration-blocks uint))
+    (let (
+        (base-rate u5)
+        (duration-factor (/ duration-blocks u1000))
+        (coverage-factor (/ coverage-amount u10000))
+    )
+    (+ (* base-rate duration-factor) coverage-factor)
+    )
+)
+
+(define-public (purchase-insurance (coverage-amount uint) (duration-blocks uint) (protected-score uint))
+    (let (
+        (premium (calculate-premium coverage-amount duration-blocks))
+        (current-score (calculate-credit-score tx-sender))
+        (existing-policy (get-insurance-policy tx-sender))
+    )
+    (asserts! (> coverage-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= current-score u500) ERR_UNAUTHORIZED)
+    (asserts! (>= protected-score u400) ERR_INVALID_AMOUNT)
+    (asserts! (is-none existing-policy) ERR_POLICY_ACTIVE)
+    (asserts! (>= (get-user-balance tx-sender) premium) ERR_INSUFFICIENT_PREMIUM)
+    (map-set user-balances tx-sender (- (get-user-balance tx-sender) premium))
+    (var-set insurance-pool (+ (var-get insurance-pool) premium))
+    (var-set total-premiums (+ (var-get total-premiums) premium))
+    (map-set insurance-policies tx-sender {
+        coverage-amount: coverage-amount,
+        premium-paid: premium,
+        protected-score: protected-score,
+        expiry-block: (+ stacks-block-height duration-blocks),
+        active: true,
+        claims-used: u0,
+        max-claims: u3,
+        purchased-at: stacks-block-height
+    })
+    (ok premium)
+    )
+)
+
+(define-public (claim-insurance)
+    (let (
+        (policy (unwrap! (get-insurance-policy tx-sender) ERR_INSURANCE_NOT_FOUND))
+        (current-score (calculate-credit-score tx-sender))
+        (claim-history (get-claim-history tx-sender))
+        (score-drop (- (get protected-score policy) current-score))
+        (payout (if (< (get coverage-amount policy) (* score-drop u1000))
+                    (get coverage-amount policy)
+                    (* score-drop u1000)))
+    )
+    (asserts! (get active policy) ERR_INSURANCE_EXPIRED)
+    (asserts! (< stacks-block-height (get expiry-block policy)) ERR_INSURANCE_EXPIRED)
+    (asserts! (< current-score (get protected-score policy)) ERR_CLAIM_NOT_ELIGIBLE)
+    (asserts! (< (get claims-used policy) (get max-claims policy)) ERR_CLAIM_NOT_ELIGIBLE)
+    (asserts! (>= (var-get insurance-pool) payout) ERR_INSUFFICIENT_BALANCE)
+    (map-set user-balances tx-sender (+ (get-user-balance tx-sender) payout))
+    (var-set insurance-pool (- (var-get insurance-pool) payout))
+    (map-set insurance-policies tx-sender (merge policy {
+        claims-used: (+ (get claims-used policy) u1)
+    }))
+    (map-set insurance-claims tx-sender (merge claim-history {
+        last-claim-block: stacks-block-height,
+        total-claims: (+ (get total-claims claim-history) u1),
+        total-payout: (+ (get total-payout claim-history) payout)
+    }))
+    (ok payout)
     )
 )
