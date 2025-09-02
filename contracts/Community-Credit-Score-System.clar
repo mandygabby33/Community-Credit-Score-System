@@ -19,6 +19,10 @@
 (define-constant ERR_INSUFFICIENT_GUARANTEE_SCORE (err u110))
 (define-constant ERR_GUARANTEE_LIMIT_EXCEEDED (err u111))
 
+(define-constant ERR_FREEZE_NOT_FOUND (err u117))
+(define-constant ERR_FREEZE_ALREADY_ACTIVE (err u118))
+(define-constant ERR_INSUFFICIENT_FREEZE_FEE (err u119))
+(define-constant ERR_FREEZE_EXPIRED (err u120))
 
 (define-map user-profiles principal {
     total-borrowed: uint,
@@ -369,6 +373,16 @@
 (define-data-var insurance-pool uint u0)
 (define-data-var total-premiums uint u0)
 
+(define-map freeze-protections principal {
+    frozen-score: uint,
+    expiry-block: uint,
+    fee-paid: uint,
+    active: bool,
+    purchased-at: uint
+})
+
+(define-data-var freeze-revenue uint u0)
+
 (define-read-only (get-insurance-policy (user principal))
     (map-get? insurance-policies user)
 )
@@ -448,5 +462,82 @@
         total-payout: (+ (get total-payout claim-history) payout)
     }))
     (ok payout)
+    )
+)
+
+(define-read-only (get-freeze-protection (user principal))
+    (map-get? freeze-protections user)
+)
+
+(define-read-only (calculate-freeze-fee (duration-blocks uint) (score-value uint))
+    (let (
+        (base-fee u1000)
+        (duration-factor (/ duration-blocks u100))
+        (score-factor (/ score-value u100))
+    )
+    (+ base-fee (* duration-factor score-factor))
+    )
+)
+
+(define-read-only (is-freeze-active (user principal))
+    (match (get-freeze-protection user)
+        freeze-data (and 
+            (get active freeze-data)
+            (< stacks-block-height (get expiry-block freeze-data))
+        )
+        false
+    )
+)
+
+(define-public (purchase-freeze-protection (duration-blocks uint))
+    (let (
+        (current-score (calculate-credit-score tx-sender))
+        (freeze-fee (calculate-freeze-fee duration-blocks current-score))
+        (user-balance (get-user-balance tx-sender))
+        (existing-freeze (get-freeze-protection tx-sender))
+    )
+    (asserts! (> duration-blocks u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= current-score u500) ERR_UNAUTHORIZED)
+    (asserts! (is-none existing-freeze) ERR_FREEZE_ALREADY_ACTIVE)
+    (asserts! (>= user-balance freeze-fee) ERR_INSUFFICIENT_FREEZE_FEE)
+    (map-set user-balances tx-sender (- user-balance freeze-fee))
+    (var-set freeze-revenue (+ (var-get freeze-revenue) freeze-fee))
+    (map-set freeze-protections tx-sender {
+        frozen-score: current-score,
+        expiry-block: (+ stacks-block-height duration-blocks),
+        fee-paid: freeze-fee,
+        active: true,
+        purchased-at: stacks-block-height
+    })
+    (ok current-score)
+    )
+)
+
+(define-public (deactivate-freeze-protection)
+    (let (
+        (freeze-data (unwrap! (get-freeze-protection tx-sender) ERR_FREEZE_NOT_FOUND))
+    )
+    (asserts! (get active freeze-data) ERR_FREEZE_EXPIRED)
+    (map-set freeze-protections tx-sender (merge freeze-data {active: false}))
+    (ok true)
+    )
+)
+
+(define-read-only (get-protected-score (user principal))
+    (let (
+        (current-score (calculate-credit-score user))
+        (freeze-protection (get-freeze-protection user))
+    )
+    (match freeze-protection
+        freeze-data (if (and 
+            (get active freeze-data)
+            (< stacks-block-height (get expiry-block freeze-data))
+            (> (get frozen-score freeze-data) current-score)
+        )
+            (get frozen-score freeze-data)
+            current-score
+        )
+        current-score
+    )
     )
 )
