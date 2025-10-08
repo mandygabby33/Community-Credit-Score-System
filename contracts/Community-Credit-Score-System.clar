@@ -24,6 +24,10 @@
 (define-constant ERR_INSUFFICIENT_FREEZE_FEE (err u119))
 (define-constant ERR_FREEZE_EXPIRED (err u120))
 
+(define-constant ERR_MILESTONE_ALREADY_CLAIMED (err u121))
+(define-constant ERR_MILESTONE_NOT_ACHIEVED (err u122))
+(define-constant ERR_INSUFFICIENT_REWARD_POOL (err u123))
+
 (define-map user-profiles principal {
     total-borrowed: uint,
     total-repaid: uint,
@@ -539,5 +543,97 @@
         )
         current-score
     )
+    )
+)
+
+(define-map milestone-achievements principal {
+    milestone-600-claimed: bool,
+    milestone-700-claimed: bool,
+    milestone-800-claimed: bool,
+    milestone-900-claimed: bool,
+    total-rewards-earned: uint,
+    last-claim-block: uint
+})
+
+(define-data-var reward-pool-balance uint u0)
+(define-data-var total-rewards-distributed uint u0)
+
+(define-read-only (get-milestone-achievements (user principal))
+    (default-to 
+        {
+            milestone-600-claimed: false,
+            milestone-700-claimed: false,
+            milestone-800-claimed: false,
+            milestone-900-claimed: false,
+            total-rewards-earned: u0,
+            last-claim-block: u0
+        }
+        (map-get? milestone-achievements user)
+    )
+)
+
+(define-read-only (get-reward-pool-stats)
+    (ok {
+        pool-balance: (var-get reward-pool-balance),
+        total-distributed: (var-get total-rewards-distributed)
+    })
+)
+
+(define-read-only (calculate-milestone-reward (milestone-tier uint))
+    (if (is-eq milestone-tier u600)
+        u50000
+        (if (is-eq milestone-tier u700)
+            u100000
+            (if (is-eq milestone-tier u800)
+                u200000
+                (if (is-eq milestone-tier u900)
+                    u500000
+                    u0
+                )
+            )
+        )
+    )
+)
+
+(define-public (claim-milestone-reward (milestone-tier uint))
+    (let (
+        (current-score (calculate-credit-score tx-sender))
+        (achievements (get-milestone-achievements tx-sender))
+        (reward-amount (calculate-milestone-reward milestone-tier))
+    )
+    (asserts! (> reward-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= current-score milestone-tier) ERR_MILESTONE_NOT_ACHIEVED)
+    (asserts! (>= (var-get reward-pool-balance) reward-amount) ERR_INSUFFICIENT_REWARD_POOL)
+    (if (is-eq milestone-tier u600)
+        (asserts! (not (get milestone-600-claimed achievements)) ERR_MILESTONE_ALREADY_CLAIMED)
+        (if (is-eq milestone-tier u700)
+            (asserts! (not (get milestone-700-claimed achievements)) ERR_MILESTONE_ALREADY_CLAIMED)
+            (if (is-eq milestone-tier u800)
+                (asserts! (not (get milestone-800-claimed achievements)) ERR_MILESTONE_ALREADY_CLAIMED)
+                (asserts! (not (get milestone-900-claimed achievements)) ERR_MILESTONE_ALREADY_CLAIMED)
+            )
+        )
+    )
+    (map-set user-balances tx-sender (+ (get-user-balance tx-sender) reward-amount))
+    (var-set reward-pool-balance (- (var-get reward-pool-balance) reward-amount))
+    (var-set total-rewards-distributed (+ (var-get total-rewards-distributed) reward-amount))
+    (map-set milestone-achievements tx-sender {
+        milestone-600-claimed: (or (get milestone-600-claimed achievements) (is-eq milestone-tier u600)),
+        milestone-700-claimed: (or (get milestone-700-claimed achievements) (is-eq milestone-tier u700)),
+        milestone-800-claimed: (or (get milestone-800-claimed achievements) (is-eq milestone-tier u800)),
+        milestone-900-claimed: (or (get milestone-900-claimed achievements) (is-eq milestone-tier u900)),
+        total-rewards-earned: (+ (get total-rewards-earned achievements) reward-amount),
+        last-claim-block: stacks-block-height
+    })
+    (ok reward-amount)
+    )
+)
+
+(define-public (contribute-to-reward-pool (amount uint))
+    (begin
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (var-set reward-pool-balance (+ (var-get reward-pool-balance) amount))
+        (ok amount)
     )
 )
