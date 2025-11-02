@@ -19,6 +19,12 @@
 (define-constant ERR_INSUFFICIENT_GUARANTEE_SCORE (err u110))
 (define-constant ERR_GUARANTEE_LIMIT_EXCEEDED (err u111))
 
+(define-constant ERR_REFERRAL_EXISTS (err u124))
+(define-constant ERR_REFERRAL_NOT_FOUND (err u125))
+(define-constant ERR_SELF_REFERRAL (err u126))
+(define-constant ERR_REFERRAL_LIMIT_REACHED (err u127))
+(define-constant ERR_INSUFFICIENT_REFERRAL_EARNINGS (err u128))
+
 (define-constant ERR_FREEZE_NOT_FOUND (err u117))
 (define-constant ERR_FREEZE_ALREADY_ACTIVE (err u118))
 (define-constant ERR_INSUFFICIENT_FREEZE_FEE (err u119))
@@ -635,5 +641,126 @@
         (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
         (var-set reward-pool-balance (+ (var-get reward-pool-balance) amount))
         (ok amount)
+    )
+)
+
+(define-map referral-relationships principal {
+    referrer: principal,
+    registered-block: uint,
+    referral-count: uint,
+    referral-tier: uint
+})
+
+(define-map referrer-stats principal {
+    total-referrals: uint,
+    active-referrals: uint,
+    total-earnings: uint,
+    pending-earnings: uint,
+    last-payout-block: uint,
+    tier-1-referrals: uint,
+    tier-2-referrals: uint
+})
+
+(define-map referral-earnings {referrer: principal, referee: principal} {
+    total-generated: uint,
+    last-activity: uint,
+    commission-rate: uint
+})
+
+(define-data-var referral-pool uint u0)
+(define-data-var total-referral-payouts uint u0)
+
+(define-read-only (get-referral-info (user principal))
+    (map-get? referral-relationships user)
+)
+
+(define-read-only (get-referrer-stats (referrer principal))
+    (default-to 
+        {
+            total-referrals: u0,
+            active-referrals: u0,
+            total-earnings: u0,
+            pending-earnings: u0,
+            last-payout-block: u0,
+            tier-1-referrals: u0,
+            tier-2-referrals: u0
+        }
+        (map-get? referrer-stats referrer)
+    )
+)
+
+(define-read-only (calculate-referral-commission (loan-amount uint) (tier uint))
+    (if (is-eq tier u1)
+        (/ (* loan-amount u5) u100)
+        (/ (* loan-amount u2) u100)
+    )
+)
+
+(define-public (register-referral (referrer principal))
+    (let (
+        (referee-info (get-referral-info tx-sender))
+        (referrer-profile (get-user-profile referrer))
+        (stats (get-referrer-stats referrer))
+    )
+    (asserts! (not (is-eq tx-sender referrer)) ERR_SELF_REFERRAL)
+    (asserts! (is-none referee-info) ERR_REFERRAL_EXISTS)
+    (asserts! (< (get total-referrals stats) u100) ERR_REFERRAL_LIMIT_REACHED)
+    (map-set referral-relationships tx-sender {
+        referrer: referrer,
+        registered-block: stacks-block-height,
+        referral-count: u0,
+        referral-tier: u1
+    })
+    (map-set referrer-stats referrer (merge stats {
+        total-referrals: (+ (get total-referrals stats) u1),
+        active-referrals: (+ (get active-referrals stats) u1),
+        tier-1-referrals: (+ (get tier-1-referrals stats) u1)
+    }))
+    (ok true)
+    )
+)
+
+(define-public (process-referral-commission (referee principal) (loan-amount uint))
+    (match (get-referral-info referee)
+        referral-data (let (
+            (referrer (get referrer referral-data))
+            (tier (get referral-tier referral-data))
+            (commission (calculate-referral-commission loan-amount tier))
+            (stats (get-referrer-stats referrer))
+            (existing-earnings (default-to 
+                {total-generated: u0, last-activity: u0, commission-rate: u5}
+                (map-get? referral-earnings {referrer: referrer, referee: referee})
+            ))
+        )
+        (map-set referrer-stats referrer (merge stats {
+            pending-earnings: (+ (get pending-earnings stats) commission)
+        }))
+        (map-set referral-earnings {referrer: referrer, referee: referee} (merge existing-earnings {
+            total-generated: (+ (get total-generated existing-earnings) commission),
+            last-activity: stacks-block-height
+        }))
+        (var-set referral-pool (+ (var-get referral-pool) commission))
+        (ok commission)
+        )
+        (ok u0)
+    )
+)
+
+(define-public (claim-referral-earnings)
+    (let (
+        (stats (get-referrer-stats tx-sender))
+        (pending (get pending-earnings stats))
+    )
+    (asserts! (> pending u0) ERR_INSUFFICIENT_REFERRAL_EARNINGS)
+    (asserts! (>= (var-get referral-pool) pending) ERR_INSUFFICIENT_BALANCE)
+    (map-set user-balances tx-sender (+ (get-user-balance tx-sender) pending))
+    (var-set referral-pool (- (var-get referral-pool) pending))
+    (var-set total-referral-payouts (+ (var-get total-referral-payouts) pending))
+    (map-set referrer-stats tx-sender (merge stats {
+        total-earnings: (+ (get total-earnings stats) pending),
+        pending-earnings: u0,
+        last-payout-block: stacks-block-height
+    }))
+    (ok pending)
     )
 )
